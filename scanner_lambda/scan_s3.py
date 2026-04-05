@@ -1,53 +1,104 @@
 import boto3
-from botocore.exceptions import ClientError
+import json
 
-s3_client = boto3.client("s3")
+s3 = boto3.client("s3")
 
 def scan_s3():
-    findings = []
+    results = []
 
-    try:
-        buckets = s3_client.list_buckets()["Buckets"]
-    except ClientError as e:
-        print(f"Error listing buckets: {e}")
-        return findings
+    for b in s3.list_buckets()["Buckets"]:
+        name   = b["Name"]
+        region = _get_region(name)
 
-    for bucket in buckets:
-        bucket_name = bucket["Name"]
-
-        bucket_data = {
-            "bucket_name": bucket_name,
-            "public_access_block": None,
-            "acl_public": False,
-            "encryption_enabled": True
-        }
-
-        # 1️⃣ Public Access Block (CLIENT API)
+        # ACL public (CIS 2.1.5)
         try:
-            response = s3_client.get_public_access_block(
-                Bucket=bucket_name
+            acl = s3.get_bucket_acl(Bucket=name)
+            public_acl = any(
+                g["Grantee"].get("URI", "").endswith("AllUsers")
+                for g in acl["Grants"]
             )
-            bucket_data["public_access_block"] = response["PublicAccessBlockConfiguration"]
-        except ClientError as e:
-            # Happens if BPA is never configured
-            bucket_data["public_access_block"] = "NOT_CONFIGURED"
+        except:
+            public_acl = False
 
-        # 2️⃣ ACL check
+        # Encryption (CIS 2.1.1)
         try:
-            acl = s3_client.get_bucket_acl(Bucket=bucket_name)
-            for grant in acl["Grants"]:
-                grantee = grant.get("Grantee", {})
-                if grantee.get("URI", "").endswith("AllUsers"):
-                    bucket_data["acl_public"] = True
-        except ClientError:
-            pass
+            s3.get_bucket_encryption(Bucket=name)
+            encrypted = True
+        except:
+            encrypted = False
 
-        # 3️⃣ Encryption check
+        # Block public access — all 4 flags (CIS 2.1.5)
         try:
-            s3_client.get_bucket_encryption(Bucket=bucket_name)
-        except ClientError:
-            bucket_data["encryption_enabled"] = False
+            pab = s3.get_bucket_public_access_block(Bucket=name)
+            cfg = pab["PublicAccessBlockConfiguration"]
+            block_public            = cfg.get("BlockPublicAcls", False)
+            ignore_public_acls      = cfg.get("IgnorePublicAcls", False)
+            block_public_policy     = cfg.get("BlockPublicPolicy", False)
+            restrict_public_buckets = cfg.get("RestrictPublicBuckets", False)
+            fully_blocked = all([
+                block_public, ignore_public_acls,
+                block_public_policy, restrict_public_buckets
+            ])
+        except:
+            block_public  = False
+            fully_blocked = False
 
-        findings.append(bucket_data)
+        # FIX #2 — single call for versioning + mfa_delete (CIS 2.1.3)
+        try:
+            v          = s3.get_bucket_versioning(Bucket=name)
+            versioning = v.get("Status") == "Enabled"
+            mfa_delete = v.get("MFADelete") == "Enabled"
+        except:
+            versioning = False
+            mfa_delete = False
 
-    return findings
+        # FIX #1 — correct allows_http logic (CIS 2.1.2)
+        # Default True: HTTP is allowed unless a Deny-on-SecureTransport=false exists
+        allows_http = True
+        try:
+            policy = json.loads(s3.get_bucket_policy(Bucket=name)["Policy"])
+            for stmt in policy.get("Statement", []):
+                if stmt.get("Effect") != "Deny":
+                    continue
+                bool_cond = stmt.get("Condition", {}).get("Bool", {})
+                # AWS header keys are case-insensitive — check both casings
+                secure = (
+                    bool_cond.get("aws:SecureTransport")
+                    or bool_cond.get("aws:securetransport")
+                )
+                if secure is not None and str(secure).lower() == "false":
+                    allows_http = False
+                    break
+        except:
+            # No bucket policy at all = HTTP is allowed
+            allows_http = True
+
+        # Server access logging (CIS 2.1.4)
+        try:
+            logging_resp    = s3.get_bucket_logging(Bucket=name)
+            logging_enabled = "LoggingEnabled" in logging_resp
+        except:
+            logging_enabled = False
+
+        results.append({
+            "bucket":          name,
+            "region":          region,
+            "public_acl":      public_acl,
+            "encrypted":       encrypted,
+            "block_public":    block_public,
+            "fully_blocked":   fully_blocked,
+            "versioning":      versioning,
+            "mfa_delete":      mfa_delete,
+            "allows_http":     allows_http,
+            "logging_enabled": logging_enabled,
+        })
+
+    return results
+
+
+def _get_region(bucket_name):
+    try:
+        loc = s3.get_bucket_location(Bucket=bucket_name)
+        return loc["LocationConstraint"] or "us-east-1"
+    except:
+        return "unknown"

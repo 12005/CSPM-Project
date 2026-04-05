@@ -1,24 +1,27 @@
 import boto3
 
-cloudtrail = boto3.client("cloudtrail")
+ct = boto3.client("cloudtrail")
 
 def scan_cloudtrail():
-    result = {
-        "trail_exists": False,
-        "multi_region": False,
-        "logging": False
-    }
-
-    trails = cloudtrail.describe_trails()["trailList"]
-
+    # FIX #3 — excludeShadowTrails avoids duplicates from other regions
+    trails = ct.describe_trails(includeShadowTrails=False)["trailList"]
     if not trails:
-        return result
+        return {
+            "enabled":        False,
+            "multi_region":   False,
+            "log_validation": False,
+            "kms_encrypted":  False,
+        }
 
-    trail = trails[0]
-    result["trail_exists"] = True
-    result["multi_region"] = trail.get("IsMultiRegionTrail", False)
+    # Prefer the multi-region trail; fall back to first available
+    trail = next((t for t in trails if t.get("IsMultiRegionTrail")), trails[0])
 
-    status = cloudtrail.get_trail_status(Name=trail["Name"])
-    result["logging"] = status.get("IsLogging", False)
+    # FIX #3 — use TrailARN instead of Name; Name can fail for cross-region trails
+    status = ct.get_trail_status(Name=trail["TrailARN"])
 
-    return result
+    return {
+        "enabled":        status["IsLogging"],
+        "multi_region":   trail["IsMultiRegionTrail"],
+        "log_validation": trail.get("LogFileValidationEnabled", False),
+        "kms_encrypted":  bool(trail.get("KmsKeyId")),
+    }
